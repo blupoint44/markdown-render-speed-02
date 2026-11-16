@@ -1421,7 +1421,7 @@ function flanking(text, i, len) {
 //  (3) When a strong match forms over a span containing such a consumed
 //      both-flanking closer, the closer run's excess characters render
 //      inside the strong element instead of after it.
-function processEmphasis(nodes, delimStack, bottom) {
+function processEmphasis(nodes, delimStack, bottom, text) {
   const snap = delimStack.slice();
   const snapIdx = new Map(snap.map((d, idx) => [d, idx]));
   const betweenOf = (op, cl) => {
@@ -1491,6 +1491,34 @@ function processEmphasis(nodes, delimStack, bottom) {
         (op.len + closer.len) % 3 === 0 &&
         !(op.len % 3 === 0 && closer.len % 3 === 0)) return 1;
     if (closer.ch === '~') return 0;
+    // A ** strong whose span holds a del whose content ends with a
+    // single-star em is refused by the reference renderer — unless the
+    // em is the del's only child or its opening run sits intraword
+    // (an alphanumeric immediately before the run): **a ~~b *c*~~ d**
+    // stays literal, while **a ~~x*c*~~ d** and **a ~~*c*~~ d** form.
+    // Established by black-box probing (round 5).
+    if (text && closer.ch === '*' && op.len === 2 && closer.len === 2) {
+      const oi2 = nodes.indexOf(op);
+      const ci2 = nodes.indexOf(closer);
+      if (oi2 >= 0 && ci2 > oi2 + 1) {
+        for (let k = oi2 + 1; k < ci2; k++) {
+          const nd = nodes[k];
+          if (!nd || nd.t !== 'del' || !nd.children || nd.children.length < 2) continue;
+          const last = nd.children[nd.children.length - 1];
+          if (!last || last.t !== 'em' || last.srcEnd === undefined) continue;
+          // The em must end exactly at the del's end: its closing run
+          // starts at last.srcEnd and must end where the del's content
+          // ends (nd.srcEnd, the del closer's position).
+          let ce = last.srcEnd;
+          while (ce < text.length && text[ce] === '*') ce++;
+          if (ce !== nd.srcEnd) continue;
+          let p = last.srcStart - 1;
+          while (p >= 0 && text[p] === '*') p--;
+          const before = p >= 0 ? text[p] : '';
+          if (!/[A-Za-z0-9]/.test(before)) return 2;
+        }
+      }
+    }
     if (op.len === 2 && closer.len === 2 &&
         (shadowed(closer) ||
          (op.canOpen && op.canClose && shadowed(op) && hasOuterOpener(op)))) return 2;
@@ -2050,6 +2078,20 @@ function parseInline(text, ctx) {
       if (!bracket || !bracket.active) {
         if (bracket) {
           bracketStack.pop();
+          if (masks && text[i + 1] === '[') {
+            // Same re-lex mask drop as on the active fail path below:
+            // a full-reference attempt hanging off an inactive bracket
+            // whose reference resolves still frees what follows.
+            const lab3 = scanRefLabel(text, i + 2);
+            if (lab3) {
+              const rawLabel = lab3.raw === '' ? text.slice(bracket.srcStart, i) : lab3.raw;
+              if (defs.get(normalizeLabel(rawLabel))) {
+                const from = bracket.srcStart - (bracket.isImage ? 2 : 1);
+                masks.ranges = masks.ranges.filter(([a, b]) => b <= from || a >= lab3.end);
+                masks.inert = masks.inert.filter(([a, b]) => b <= from || a >= lab3.end);
+              }
+            }
+          }
           // An inactive bracket (a nested link already claimed the
           // span) is plain text for the reference renderer: when its
           // label holds a bare URL, rescan the label with the bracket
@@ -2136,7 +2178,24 @@ function parseInline(text, ctx) {
           continue;
         }
       }
-      processEmphasis(nodes, delimStack, bracket.delimLen);
+      if (!link && masks && text[i + 1] === '[') {
+        // A full-reference attempt whose reference resolves but whose
+        // link fails (the label's backticks bar it) makes the reference
+        // renderer re-lex the text in pieces: code-mask ranges that
+        // overlap the whole attempt stop shadowing what follows, so a
+        // delimiter after the attempt can close even when a stray
+        // backtick inside the label had paired across it (round 5).
+        const lab2 = scanRefLabel(text, i + 2);
+        if (lab2) {
+          const rawLabel = lab2.raw === '' ? labelText : lab2.raw;
+          if (defs.get(normalizeLabel(rawLabel))) {
+            const from = bracket.srcStart - (bracket.isImage ? 2 : 1);
+            masks.ranges = masks.ranges.filter(([a, b]) => b <= from || a >= lab2.end);
+            masks.inert = masks.inert.filter(([a, b]) => b <= from || a >= lab2.end);
+          }
+        }
+      }
+      processEmphasis(nodes, delimStack, bracket.delimLen, text);
       if (link) {
         // A formed link insulates the raw-anchor state: tags inside
         // its label neither set nor clear the state for the text
@@ -2271,7 +2330,7 @@ function parseInline(text, ctx) {
               }
               changed = true;
             }
-            if (changed) processEmphasis(node.children, delims.slice(), 0);
+            if (changed) processEmphasis(node.children, delims.slice(), 0, text);
           }
         }
       }
@@ -2279,7 +2338,7 @@ function parseInline(text, ctx) {
     }
   };
   flushText();
-  processEmphasis(nodes, delimStack, 0);
+  processEmphasis(nodes, delimStack, 0, text);
   applySpanRecursion(nodes);
   return nodes;
 }
