@@ -2211,8 +2211,55 @@ function parseInline(text, ctx) {
         // shadow over the text up to the next code span.
         if (masks && !viaParens) {
           const from = bracket.srcStart - (bracket.isImage ? 2 : 1);
-          masks.ranges = masks.ranges.filter(([a]) => a < from || a >= consumedEnd);
           masks.inert = masks.inert.filter(([a]) => a < from || a >= consumedEnd);
+          const dropped = masks.ranges.filter(([a]) => a >= from && a < consumedEnd);
+          if (!dropped.length) {
+            masks.ranges = masks.ranges.filter(([a]) => a < from || a >= consumedEnd);
+          } else {
+            // Dropping a range frees the run that closed it: that run
+            // becomes an opener and pairs with the next run, shifting
+            // every later pairing by one run. A plain filter leaves the
+            // shifted ranges in place, and their stale shadows kill
+            // delimiter pairs the reference renderer forms (its scan
+            // consumed the label's runs, so its pairings after the link
+            // start fresh). Rebuild the ranges from the first dropped
+            // range onward, skipping the consumed label region and the
+            // interiors of the ranges that survive.
+            const cut = Math.min(...dropped.map(([a]) => a));
+            const kept = masks.ranges.filter(([a]) => a < cut);
+            const skipTo = (p) => {
+              if (p >= from && p < consumedEnd) return consumedEnd;
+              for (const [a, b] of kept) if (p >= a && p < b) return b;
+              return p;
+            };
+            const rebuilt = [];
+            const n = text.length;
+            let i = cut;
+            while (i < n) {
+              const sk = skipTo(i);
+              if (sk !== i) { i = sk; continue; }
+              const c = text[i];
+              if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) { i += 2; continue; }
+              if (c !== '`') { i++; continue; }
+              let run = 0;
+              while (i + run < n && text[i + run] === '`') run++;
+              let close = -1;
+              let j = i + run;
+              while (j < n) {
+                const sj = skipTo(j);
+                if (sj !== j) { j = sj; continue; }
+                if (text[j] === '`') {
+                  let r = 0;
+                  while (j + r < n && text[j + r] === '`') r++;
+                  if (r === run) { close = j; break; }
+                  j += r;
+                } else j++;
+              }
+              if (close >= 0) { rebuilt.push([i, close + run]); i = close + run; continue; }
+              i += run;
+            }
+            masks.ranges = kept.concat(rebuilt);
+          }
         }
         flushText();
         const bIdx = nodes.indexOf(bracket.node);

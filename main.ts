@@ -21,7 +21,12 @@ interface Case {
 function resolveDirs(argv: string[]): { inputDir: string; outputDir: string } {
   const flag = (name: string): string | undefined => {
     const i = argv.indexOf(name);
-    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+    if (i < 0 || i + 1 >= argv.length) return undefined;
+    // A following token that is itself a flag is not this flag's value:
+    // `--input --output /x` means --input was left dangling, and taking
+    // '--output' as a directory would surface as a baffling ENOENT later.
+    const v = argv[i + 1];
+    return v.startsWith('--') ? undefined : v;
   };
   return {
     inputDir: flag('--input') ?? process.env.MAKEFUN_INPUT_DIR ?? '/input',
@@ -30,8 +35,22 @@ function resolveDirs(argv: string[]): { inputDir: string; outputDir: string } {
 }
 
 function loadCases(inputDir: string): Case[] {
-  const raw = readFileSync(join(inputDir, 'cases.json'), 'utf8');
-  return JSON.parse(raw) as Case[];
+  const path = join(inputDir, 'cases.json');
+  // Strip a UTF-8 BOM if present: JSON.parse rejects it, and harness-side
+  // writers have been known to emit one.
+  const raw = readFileSync(path, 'utf8').replace(/^\uFEFF/, '');
+  const data: unknown = JSON.parse(raw);
+  // Validate the shape up front: a malformed cases file should fail here,
+  // naming the file, not as a TypeError deep inside the render loop.
+  if (!Array.isArray(data)) {
+    throw new Error(`${path}: expected a JSON array of cases`);
+  }
+  for (const c of data as Case[]) {
+    if (typeof c?.id !== 'string' || typeof c?.markdown !== 'string') {
+      throw new Error(`${path}: every case needs a string id and markdown`);
+    }
+  }
+  return data as Case[];
 }
 
 // Render into a preallocated array: cases are independent, order is the
