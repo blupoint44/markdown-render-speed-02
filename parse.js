@@ -1329,6 +1329,20 @@ function processEmphasis(nodes, delimStack, bottom) {
     }
     return false;
   };
+  // Is there an earlier still-open run of the same char and length >= 2
+  // below this one? The shadowed-opener block applies only when skipping
+  // the opener lets the closer reach such an outer opener (**a *b*other
+  // **c**); a fresh intraword pair after a closed em (…*a* b**c**d) is
+  // not blocked.
+  const hasOuterOpener = (op) => {
+    const idx = snapIdx.get(op);
+    if (idx === undefined) return false;
+    for (let k = idx - 1; k >= 0; k--) {
+      const d = snap[k];
+      if (d.ch === op.ch && d.len >= 2 && d.canOpen) return true;
+    }
+    return false;
+  };
   // Returns 0 when the pair may match, 1 when the rule of three blocks
   // it, 2 when a shadow rule blocks it.
   const emphBlocked = (op, closer) => {
@@ -1338,7 +1352,7 @@ function processEmphasis(nodes, delimStack, bottom) {
     if (closer.ch === '~') return 0;
     if (op.len === 2 && closer.len === 2 &&
         (shadowed(closer) ||
-         (op.canOpen && op.canClose && shadowed(op)))) return 2;
+         (op.canOpen && op.canClose && shadowed(op) && hasOuterOpener(op)))) return 2;
     // A use-1 match may not span a both-flanking run of length >= 2 that
     // already closed a strong: *a **b**c* keeps the outer stars literal.
     // It does not apply when that strong's opener is the candidate opener
