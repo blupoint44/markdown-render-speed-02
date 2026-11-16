@@ -998,7 +998,9 @@ function lexBlockquote(lines, i, end, defs, tailTerminated) {
       }
       if (isParaContinuation(inner[inner.length - 1], line)) {
         cont.add(inner.length);
-        inner.push(line.replace(/^[ \t]+/, ''));
+        // Lazy lines keep their indentation up to three columns; a
+        // deeper-indented lazy line loses its leading whitespace.
+        inner.push(leadingCols(line) >= 4 ? line.replace(/^[ \t]+/, '') : line);
         prevLazy = true;
         j++;
         continue;
@@ -1006,7 +1008,23 @@ function lexBlockquote(lines, i, end, defs, tailTerminated) {
     }
     break;
   }
+  // A whitespace-only content line at the very end of the quote is kept
+  // as paragraph text (marked's capture ends there), though anywhere
+  // else it separates blocks: > foo / > ␣␣ renders foo\n␣ in the <p>.
+  let tailWs = null;
+  if (inner.length >= 2) {
+    const lastInner = inner[inner.length - 1];
+    if (lastInner.length > 0 && isBlank(lastInner) &&
+        !isBlank(inner[inner.length - 2])) {
+      tailWs = lastInner;
+      inner.pop();
+    }
+  }
   const children = lexBlocks(inner, 0, inner.length, defs, false);
+  if (tailWs !== null && children.length > 0 &&
+      children[children.length - 1].type === 'paragraph') {
+    children[children.length - 1].text += '\n' + tailWs;
+  }
   return { block: { type: 'blockquote', children }, next: j };
 }
 
@@ -1094,7 +1112,7 @@ function lexList(lines, i, end, defs, firstMarker, tailTerminated) {
         }
         if (isParaContinuation(itemLines[itemLines.length - 1], L, true)) {
           itemCont.add(itemLines.length);
-          itemLines.push(L.replace(/^[ \t]+/, ''));
+          itemLines.push(leadingCols(L) >= 4 ? L.replace(/^[ \t]+/, '') : L);
           j++;
           continue;
         }
@@ -1506,6 +1524,34 @@ function linkFormsAt(text, bracket, cp, defs) {
   return !!defs.get(normalizeLabel(label));
 }
 
+/**
+ * Marked decides emphasis over a copy of the inline text in which code
+ * spans are masked out, and the masking pairs backtick runs across the
+ * whole paragraph — even runs sitting inside link labels. A delimiter
+ * run inside a masked range is inert. The ranges use plain code-span
+ * pairing (a run closes at the next run of equal length), computed
+ * independently of how links and spans actually tokenize.
+ */
+function computeCodeMasks(text) {
+  const ranges = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '\\' && i + 1 < n && isAsciiPunct(text[i + 1])) { i += 2; continue; }
+    if (c === '`') {
+      let run = 0;
+      while (i + run < n && text[i + run] === '`') run++;
+      const close = findCodeClose(text, i + run, run, n);
+      if (close >= 0) { ranges.push([i, close + run]); i = close + run; continue; }
+      i += run;
+      continue;
+    }
+    i++;
+  }
+  return ranges;
+}
+
 function parseInline(text, ctx) {
   const defs = ctx.defs;
   let rawAnchor = ctx.inRawAnchor;
@@ -1516,6 +1562,16 @@ function parseInline(text, ctx) {
   const delimStack = [];
   const bracketStack = [];
   const n = text.length;
+  const masks = text.indexOf('`') >= 0 ? computeCodeMasks(text) : null;
+  const inMask = masks
+    ? (pos) => {
+        for (const [a, b] of masks) {
+          if (pos < a) return false;
+          if (pos < b) return true;
+        }
+        return false;
+      }
+    : () => false;
   let buf = '';
   let i = 0;
   const flushText = () => {
@@ -1743,6 +1799,7 @@ function parseInline(text, ctx) {
       let run = 0;
       while (i + run < n && text[i + run] === c) run++;
       if (i < deadUntil) { buf += text.slice(i, i + run); i += run; continue; }
+      if (inMask(i) && bracketStack.length === 0) { buf += text.slice(i, i + run); i += run; continue; }
       if (c === '~' && run >= 3) { buf += text.slice(i, i + run); i += run; continue; }
       const fl = flanking(text, i, run);
       let canOpen;
