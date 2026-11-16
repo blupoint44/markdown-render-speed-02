@@ -1174,7 +1174,10 @@ function lexList(lines, i, end, defs, firstMarker, tailTerminated) {
         }
         if (isParaContinuation(itemLines[itemLines.length - 1], L, true)) {
           itemCont.add(itemLines.length);
-          itemLines.push(leadingCols(L) >= 4 ? L.replace(/^[ \t]+/, '') : L);
+          // A lazy continuation keeps its indentation, except that a
+          // deeply indented one (4+ columns) is dedented by exactly
+          // four columns — not by the full content indent.
+          itemLines.push(leadingCols(L) >= 4 ? dropColumns(L, 4) : L);
           j++;
           continue;
         }
