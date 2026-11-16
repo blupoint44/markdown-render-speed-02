@@ -880,13 +880,39 @@ function collectParagraph(lines, i, end, inListItem = false) {
   let j = i + 1;
   let headingLevel = 0;
   let tableAt = -1;
+  // Inside a list item, a continuation line that still carries four or
+  // more columns of indentation after the item dedent loses exactly
+  // those four columns: the reference renderer's item capture folds
+  // such a line into the paragraph as if its code-block prefix had
+  // been consumed, while shallower lines keep their indentation. A run
+  // of such deep lines is then separated from the rest of the paragraph
+  // by an empty text line, the same artifact the blockquote capture
+  // shows after a dedented lazy run.
+  let afterDeep = false;
+  const noteLine = (L, isDeep) => {
+    if (afterDeep && !isDeep) plines.push('');
+    afterDeep = isDeep;
+  };
+  const pushContinuation = (L) => {
+    const deep = inListItem && leadingCols(L) >= 4;
+    noteLine(L, deep);
+    plines.push(deep ? dropColumns(L, 4) : L);
+  };
+  // A container may flag a line index in `gapBefore`: an empty text line
+  // belongs in the paragraph just before that line (the blockquote lazy
+  // capture inserts one after a run of dedented lazy lines). The flag is
+  // honoured only when the line is actually taken as paragraph text.
+  const gaps = lines.gapBefore;
   while (j < end) {
     const L = lines[j];
     if (isBlank(L)) break;
     if (lines.cont && lines.cont.has(j)) {
       // A line a container accepted as a lazy paragraph continuation: it
       // stays paragraph text even where it would otherwise interrupt or
-      // convert (list marker, setext underline, table delimiter).
+      // convert (list marker, setext underline, table delimiter). The
+      // container already settled its indentation; keep it as pushed.
+      if (gaps && gaps.has(j)) plines.push('');
+      noteLine(L, inListItem && leadingCols(L) >= 4);
       plines.push(L);
       j++;
       continue;
@@ -901,7 +927,8 @@ function collectParagraph(lines, i, end, inListItem = false) {
       }
     }
     if (interruptsParagraph(L, inListItem)) break;
-    plines.push(L);
+    if (gaps && gaps.has(j)) plines.push('');
+    pushContinuation(L);
     j++;
   }
   return { plines, next: j, headingLevel, tableAt };
@@ -958,9 +985,19 @@ function linesEndInOpenFence(lines, defs, inListItem = false) {
 function lexBlockquote(lines, i, end, defs, tailTerminated) {
   const inner = [];
   const cont = new Set();
+  const gapBefore = new Set();
   inner.cont = cont;
+  inner.gapBefore = gapBefore;
   let j = i;
   let prevLazy = false;
+  // The reference renderer's lazy capture has two modes per paragraph,
+  // decided by its first lazy line: a shallow first lazy line keeps
+  // every lazy line of the paragraph verbatim, while a deep first lazy
+  // line (four or more columns of indentation) dedents each deep lazy
+  // line by four columns and slips an empty text line between the
+  // dedented run and whatever follows it in the paragraph.
+  let lazyDeep = null;
+  let afterDeepRun = false;
   while (j < end) {
     const line = lines[j];
     if (isBlank(line)) break;
@@ -976,7 +1013,17 @@ function lexBlockquote(lines, i, end, defs, tailTerminated) {
           content = ' '.repeat(Math.max(0, w - 1)) + content.slice(1);
           consumed = 1;
         }
-        inner.push(rebaseLeading(content, indent + 1 + consumed));
+        const pushed = rebaseLeading(content, indent + 1 + consumed);
+        if (isBlank(pushed)) {
+          // A blank content line ends the paragraph: the next lazy
+          // line, if any, decides its capture mode afresh.
+          lazyDeep = null;
+          afterDeepRun = false;
+        } else if (afterDeepRun) {
+          gapBefore.add(inner.length);
+          afterDeepRun = false;
+        }
+        inner.push(pushed);
         prevLazy = false;
         j++;
         continue;
@@ -998,9 +1045,24 @@ function lexBlockquote(lines, i, end, defs, tailTerminated) {
       }
       if (isParaContinuation(inner[inner.length - 1], line)) {
         cont.add(inner.length);
-        // Lazy lines keep their indentation below four columns; at
-        // four or more they lose exactly the four-column prefix.
-        inner.push(leadingCols(line) >= 4 ? dropColumns(line, 4) : line);
+        const cols = leadingCols(line);
+        if (lazyDeep === null) lazyDeep = cols >= 4;
+        if (lazyDeep && cols >= 4) {
+          // Deep lazy line in a deep-started paragraph: dedent by the
+          // four-column prefix and remember the run is open.
+          inner.push(dropColumns(line, 4));
+          afterDeepRun = true;
+        } else if (lazyDeep && afterDeepRun) {
+          // A shallow lazy line right after a dedented run closes the
+          // run: the empty text line goes in front of it.
+          gapBefore.add(inner.length);
+          afterDeepRun = false;
+          inner.push(line);
+        } else {
+          // Shallow-started paragraph: lazy lines are captured
+          // verbatim, whatever indentation they carry.
+          inner.push(line);
+        }
         prevLazy = true;
         j++;
         continue;
@@ -1143,6 +1205,43 @@ function lexList(lines, i, end, defs, firstMarker, tailTerminated) {
 // The block lexer
 // ---------------------------------------------------------------------------
 
+/**
+ * Consume the body of a fenced code block whose opening fence sits just
+ * before `start`. Returns the content lines, the index just past the
+ * closing fence (or `end` when the fence never closes), and whether a
+ * closing fence was found.
+ *
+ * The two fence flavours treat content indentation differently, matching
+ * the reference renderer byte for byte:
+ *  - A backtick fence sheds its own indentation: every content line loses
+ *    up to `fence.indent` leading whitespace characters (dropFenceIndent).
+ *  - A tilde fence keeps its content verbatim — no indentation is removed
+ *    from any line, however deep the fence itself is indented.
+ * A closing fence is a line under at most 3 columns of indentation whose
+ * text is a run of the fence character at least as long as the opening
+ * run, followed by nothing but spaces and tabs.
+ */
+function scanFenceBody(lines, start, end, fence) {
+  const content = [];
+  const dedent = fence.ch === '`';
+  let j = start;
+  while (j < end) {
+    const L = lines[j];
+    const ind = leadingCols(L);
+    if (ind <= 3) {
+      const s = dropColumns(L, ind);
+      let run = 0;
+      while (run < s.length && s[run] === fence.ch) run++;
+      if (run >= fence.len && /^[ \t]*$/.test(s.slice(run))) {
+        return { content, next: j + 1, closed: true };
+      }
+    }
+    content.push(dedent ? dropFenceIndent(L, fence.indent) : L);
+    j++;
+  }
+  return { content, next: j, closed: false };
+}
+
 function lexBlocks(lines, start, end, defs, tailTerminated, spans, inListItem = false) {
   const blocks = [];
   let i = start;
@@ -1177,25 +1276,10 @@ function lexBlocks(lines, start, end, defs, tailTerminated, spans, inListItem = 
     }
     const fence = matchFenceStart(line);
     if (fence) {
-      const content = [];
-      let j = i + 1;
-      let closed = false;
-      while (j < end) {
-        const L = lines[j];
-        const ind2 = leadingCols(L);
-        if (ind2 <= 3) {
-          const s = dropColumns(L, ind2);
-          let run = 0;
-          while (run < s.length && s[run] === fence.ch) run++;
-          if (run >= fence.len && /^[ \t]*$/.test(s.slice(run))) {
-            closed = true;
-            j++;
-            break;
-          }
-        }
-        content.push(dropFenceIndent(L, fence.indent));
-        j++;
-      }
+      const body = scanFenceBody(lines, i + 1, end, fence);
+      const content = body.content;
+      const closed = body.closed;
+      const j = body.next;
       const joined = content.join('\n');
       const text = joined === '' ? '' : joined.endsWith('\n') ? joined : joined + '\n';
       const lang = fence.info ? unescapePunct(fence.info.split(/[ \t]+/)[0]) : null;
@@ -1343,6 +1427,21 @@ function processEmphasis(nodes, delimStack, bottom) {
     }
     return false;
   };
+  // The span block, on its own: a use-1 match may not span a
+  // both-flanking run of length >= 2 that already closed a strong:
+  // *a **b**c* keeps the outer stars literal. It does not apply when
+  // that strong's opener is the candidate opener itself (***a**b*) or
+  // is itself both-flanking (*a**b**c*), nor once the opener has had a
+  // closer refused by this very rule (see the skip in the main loop).
+  const spanBlocked = (op, closer) => {
+    if (op.noSpanBlock) return false;
+    if (op.len >= 2 && closer.len >= 2) return false;
+    return betweenOf(op, closer).some((d) => d.ch === closer.ch &&
+      d.origLen >= 2 && d.canOpen && d.canClose &&
+      d.usedAsCloser && d.matchUse === 2 &&
+      d.matchOpener !== op &&
+      !(d.matchOpener && d.matchOpener.canOpen && d.matchOpener.canClose));
+  };
   // Returns 0 when the pair may match, 1 when the rule of three blocks
   // it, 2 when a shadow rule blocks it.
   const emphBlocked = (op, closer) => {
@@ -1353,16 +1452,7 @@ function processEmphasis(nodes, delimStack, bottom) {
     if (op.len === 2 && closer.len === 2 &&
         (shadowed(closer) ||
          (op.canOpen && op.canClose && shadowed(op) && hasOuterOpener(op)))) return 2;
-    // A use-1 match may not span a both-flanking run of length >= 2 that
-    // already closed a strong: *a **b**c* keeps the outer stars literal.
-    // It does not apply when that strong's opener is the candidate opener
-    // itself (***a**b*) or is itself both-flanking (*a**b**c*).
-    if (!(op.len >= 2 && closer.len >= 2) &&
-        betweenOf(op, closer).some((d) => d.ch === closer.ch &&
-          d.origLen >= 2 && d.canOpen && d.canClose &&
-          d.usedAsCloser && d.matchUse === 2 &&
-          d.matchOpener !== op &&
-          !(d.matchOpener && d.matchOpener.canOpen && d.matchOpener.canClose))) {
+    if (spanBlocked(op, closer)) {
       return 2;
     }
     const between = betweenOf(op, closer);
@@ -1390,6 +1480,36 @@ function processEmphasis(nodes, delimStack, bottom) {
       if (closer.ch === '~' && op.len !== closer.len) continue;
       const block = emphBlocked(op, closer);
       if (block) {
+        // Span-block skip: a length-1 closer refused by the span rule
+        // against its nearest opener does not simply die when a whole
+        // intraword pair follows it — the reference renderer closes the
+        // opener at the pair's far star instead, leaving this closer
+        // and the pair's near star as literal text inside the emphasis
+        // (*a **b**c* d*e*f is one big em, not literal stars + *e*).
+        // Retire both runs and lift the span block for this opener so
+        // the far star can match it when its turn comes.
+        if (!examined && block === 2 && closer.len === 1 && op.len === 1 &&
+            spanBlocked(op, closer)) {
+          let pairNear = null;
+          let pairFar = null;
+          for (let m = ci + 1; m < delimStack.length; m++) {
+            const d = delimStack[m];
+            if (d.ch !== closer.ch || d.len === 0) continue;
+            if (!pairNear) { pairNear = d; continue; }
+            pairFar = d;
+            break;
+          }
+          if (pairNear && pairFar &&
+              pairNear.len === 1 && pairNear.canOpen && pairNear.canClose &&
+              pairFar.len === 1 && pairFar.canClose) {
+            closer.canOpen = false;
+            closer.canClose = false;
+            pairNear.canOpen = false;
+            pairNear.canClose = false;
+            op.noSpanBlock = true;
+            break;
+          }
+        }
         // A both-flanking closer of length 1 whose nearest opener is
         // refused by the rule of three does not look further down the
         // stack: it stays available as an opener for a later closer
@@ -1567,15 +1687,44 @@ function computeCodeMasks(text) {
 }
 
 /**
- * Fence content dedent: a content line loses up to `indent` leading
- * whitespace CHARACTERS — a tab counts as one character, not four
- * columns (``` at indent 1 turns a leading tab into nothing, while
- * one leading space in front of the tab shields it).
+ * Backtick-fence content dedent (tilde fences keep content verbatim; see
+ * scanFenceBody): a content line loses up to `indent` leading whitespace
+ * CHARACTERS — a tab counts as one character, not four columns (``` at
+ * indent 1 turns a leading tab into nothing, while one leading space in
+ * front of the tab shields it).
  */
 function dropFenceIndent(line, indent) {
   let i = 0;
   while (i < indent && (line[i] === ' ' || line[i] === '\t')) i++;
   return line.slice(i);
+}
+
+/** Cheap prefix test for a URL-type autolink at s[p] (www. or a
+ * scheme:// head), so the full matcher only runs where a URL can
+ * actually start — most w/h/f letters begin ordinary words. */
+function urlPrefixAt(s, p) {
+  const c = s[p];
+  if (c === 'w') return s.startsWith('www.', p);
+  if (c === 'h' || c === 'H' || c === 'f' || c === 'F') {
+    const tail = s.slice(p, p + 8).toLowerCase();
+    return tail.startsWith('http://') || tail.startsWith('https://') ||
+      tail.startsWith('ftp://');
+  }
+  return false;
+}
+
+/** True when the source span [from, to) holds a URL-type autolink
+ * candidate outside any code-span mask. Used to decide whether a
+ * failed bracket's span must be rescanned as ordinary text. */
+function labelHasUrl(text, from, to, inMask) {
+  for (let p = from; p < to; p++) {
+    const ch = text[p];
+    if (ch !== 'w' && ch !== 'h' && ch !== 'H' && ch !== 'f' && ch !== 'F') continue;
+    if (!urlPrefixAt(text, p)) continue;
+    if (inMask(p)) continue;
+    if (matchUrlAutolink(text, p)) return true;
+  }
+  return false;
 }
 
 function parseInline(text, ctx) {
@@ -1587,6 +1736,9 @@ function parseInline(text, ctx) {
   const nodes = [];
   const delimStack = [];
   const bracketStack = [];
+  // Count of currently active brackets, maintained alongside the stack
+  // (the scan-time autolink rule needs it per character).
+  let activeBrackets = 0;
   const n = text.length;
   const masks = text.indexOf('`') >= 0 ? computeCodeMasks(text) : null;
   const inMask = masks
@@ -1605,6 +1757,22 @@ function parseInline(text, ctx) {
   };
   while (i < n) {
     const c = text[i];
+    // URL-type bare autolinks are recognised here, at scan time: the
+    // reference tokenizer commits to the URL at its first character, so
+    // brackets, delimiters and backticks inside it never become markup.
+    // The rule applies inside a failed link's paren group too (only its
+    // delimiters are dead there, not its text), but not inside an open
+    // bracket, a code-span mask, or a raw <a> element.
+    if ((c === 'w' || c === 'h' || c === 'H' || c === 'f' || c === 'F') &&
+        activeBrackets === 0 && !rawAnchor && !inMask(i) && urlPrefixAt(text, i)) {
+      const a = matchUrlAutolink(text, i);
+      if (a) {
+        flushText();
+        nodes.push({ t: 'autolink', href: a.href, text: a.text, bare: true });
+        i = a.end;
+        continue;
+      }
+    }
     if (c === '\\') {
       const nx = text[i + 1];
       if (nx !== undefined && isAsciiPunct(nx)) {
@@ -1733,6 +1901,7 @@ function parseInline(text, ctx) {
       bracketStack.push({
         node, isImage: true, delimLen: delimStack.length, active: true, srcStart: i + 2,
       });
+      activeBrackets++;
       i += 2;
       continue;
     }
@@ -1743,13 +1912,32 @@ function parseInline(text, ctx) {
       bracketStack.push({
         node, isImage: false, delimLen: delimStack.length, active: true, srcStart: i + 1,
       });
+      activeBrackets++;
       i += 1;
       continue;
     }
     if (c === ']') {
       const bracket = bracketStack[bracketStack.length - 1];
       if (!bracket || !bracket.active) {
-        if (bracket) bracketStack.pop();
+        if (bracket) {
+          bracketStack.pop();
+          // An inactive bracket (a nested link already claimed the
+          // span) is plain text for the reference renderer: when its
+          // label holds a bare URL, rescan the label with the bracket
+          // gone so the URL rule can commit across what follows,
+          // exactly as on the active fail path below.
+          if (labelHasUrl(text, bracket.srcStart, i, inMask)) {
+            const bIdx = nodes.indexOf(bracket.node);
+            if (bIdx >= 0) {
+              nodes.length = bIdx + 1;
+              delimStack.length = bracket.delimLen;
+              if (deadUntil <= i) deadUntil = -1;
+              buf = '';
+              i = bracket.srcStart;
+              continue;
+            }
+          }
+        }
         buf += ']';
         i++;
         continue;
@@ -1788,6 +1976,7 @@ function parseInline(text, ctx) {
         if (def) { link = def; consumedEnd = i + 1; }
       }
       bracketStack.pop();
+      activeBrackets--;
       if (!link && parenFailed) {
         // The label's delimiters leave the stack unprocessed, so they
         // render as literal runs and later closers cannot reach them;
@@ -1797,6 +1986,24 @@ function parseInline(text, ctx) {
         deadUntil = parenEnd;
         i = i + 1;
         continue;
+      }
+      if (!link && !labelBad && labelHasUrl(text, bracket.srcStart, i, inMask)) {
+        // When a bracket fails, the reference tokenizer falls back to
+        // scanning the label as ordinary text — and a bare URL inside
+        // it then commits at its first character and runs past the
+        // bracket's own `]` and whatever follows. The nodes built for
+        // the label cannot express that (they were split at every
+        // bracket and delimiter), so discard them and rescan the label
+        // text in place with this bracket gone.
+        const bIdx = nodes.indexOf(bracket.node);
+        if (bIdx >= 0) {
+          nodes.length = bIdx + 1;
+          delimStack.length = bracket.delimLen;
+          if (deadUntil <= i) deadUntil = -1;
+          buf = '';
+          i = bracket.srcStart;
+          continue;
+        }
       }
       processEmphasis(nodes, delimStack, bracket.delimLen);
       if (link) {
@@ -1812,7 +2019,9 @@ function parseInline(text, ctx) {
         });
         delimStack.length = bracket.delimLen;
         if (!bracket.isImage) {
-          for (const b of bracketStack) if (!b.isImage) b.active = false;
+          for (const b of bracketStack) {
+            if (!b.isImage && b.active) { b.active = false; activeBrackets--; }
+          }
         }
         i = consumedEnd;
         continue;
@@ -1968,18 +2177,21 @@ function labelBlocksLink(label) {
 }
 
 /**
- * Cut a raw autolink candidate at the first parenthesis that never
- * closes: https://a.io)](https://b.io links only https://a.io)] — the
- * second URL starts a new autolink — while a balanced group is kept
- * whole (https://a.io/x(y)z, ...page=4)](./docs/create.md)).
+ * Cut a raw autolink candidate at a trailing parenthesis group that
+ * never closes: https://a.io)](https://b.io links only https://a.io)]
+ * — the second URL starts a new autolink. The cut works from the last
+ * `(` backwards: a `(` with any `)` after it keeps the whole candidate
+ * (http://a.com/b((x), http://a.com/b(a(b)c), while a `(` with no `)`
+ * after it is cut away and the check repeats on what remains.
  */
 function cutUnclosedParen(raw) {
-  const stack = [];
-  for (let k = 0; k < raw.length; k++) {
-    if (raw[k] === '(') stack.push(k);
-    else if (raw[k] === ')' && stack.length) stack.pop();
+  let u = raw;
+  for (;;) {
+    const open = u.lastIndexOf('(');
+    if (open < 0) return u;
+    if (u.indexOf(')', open) >= 0) return u;
+    u = u.slice(0, open);
   }
-  return stack.length ? raw.slice(0, stack[0]) : raw;
 }
 
 function trimAutolink(url) {
@@ -1998,14 +2210,16 @@ function trimAutolink(url) {
     }
     if (last === ')') {
       // Only parentheses are balance-trimmed; ] and } stay in the link.
-      // A trailing ) is stripped when it is unmatched in scan order
-      // (an earlier ( may still claim it: ...4)](./x) keeps its paren).
-      let depth = 0;
-      for (let k = 0; k < u.length - 1; k++) {
-        if (u[k] === '(') depth++;
-        else if (u[k] === ')' && depth > 0) depth--;
+      // A trailing ) is kept exactly when it is the single ) standing
+      // after the last ( of the URL: b(c) and b((x) keep theirs, while
+      // b(c)), b((x)) and b((x)y) each shed one, and a URL with no (
+      // at all sheds every trailing ).
+      const open = u.lastIndexOf('(');
+      let closes = 0;
+      if (open >= 0) {
+        for (let k = open + 1; k < u.length; k++) if (u[k] === ')') closes++;
       }
-      if (depth === 0) { u = u.slice(0, -1); continue; }
+      if (open < 0 || closes !== 1) { u = u.slice(0, -1); continue; }
     }
     break;
   }
@@ -2058,7 +2272,15 @@ function bufEndsWithAutolink(buf) {
   return false;
 }
 
-function matchBareAutolink(s, pos, nextCh) {
+/**
+ * Match a URL-type bare autolink (www. or scheme://) at s[pos]. These
+ * are recognised during the inline scan itself, before brackets,
+ * delimiters or backticks inside the URL can be mistaken for markup:
+ * the reference tokenizer commits to the URL at its first character
+ * and consumes everything up to whitespace or `<`. Email and mailto:
+ * forms are recognised later, at text-render time (matchBareAutolink).
+ */
+function matchUrlAutolink(s, pos) {
   const n = s.length;
   const prev = pos > 0 ? s[pos - 1] : '';
   const prevAlnum = prev !== '' &&
@@ -2082,6 +2304,18 @@ function matchBareAutolink(s, pos, nextCh) {
     const matched = trimAutolink(cutUnclosedParen(s.slice(pos, e)));
     if (matched.length <= sm[0].length) return null;
     return { end: pos + matched.length, href: matched, text: matched };
+  }
+  return null;
+}
+
+function matchBareAutolink(s, pos, nextCh) {
+  const n = s.length;
+  const prev = pos > 0 ? s[pos - 1] : '';
+  // A www. or scheme:// prefix settles the matter on its own: when it
+  // is present but invalid (or blocked by a preceding alphanumeric),
+  // no email form is attempted at the same position.
+  if (s.startsWith('www.', pos) || /^(https?|ftp):\/\//i.test(s.slice(pos, pos + 8))) {
+    return matchUrlAutolink(s, pos);
   }
   if (s.slice(pos, pos + 7).toLowerCase() === 'mailto:') {
     if (prev && EMAIL_PREV_BLOCK_RE.test(prev)) return null;
@@ -2255,7 +2489,12 @@ function renderNodes(nodes, ctx, inLink) {
         break;
       }
       case 'autolink':
-        out += '<a href="' + escapeHtml(cleanUrl(nd.href)) + '">' + escapeHtml(nd.text) + '</a>';
+        // A BARE autolink recognised at scan time inside a label that
+        // turned out to be a real link (or inside a raw <a> element) is
+        // not a link for the reference renderer either: it renders as
+        // plain text. Angle-bracket autolinks always render as links.
+        if (nd.bare && (inLink || ctx.inRawAnchor)) out += escapeHtml(nd.text);
+        else out += '<a href="' + escapeHtml(cleanUrl(nd.href)) + '">' + escapeHtml(nd.text) + '</a>';
         break;
       default: break;
     }
