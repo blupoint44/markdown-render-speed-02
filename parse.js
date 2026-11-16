@@ -1660,13 +1660,24 @@ function linkFormsAt(text, bracket, cp, defs) {
 
 /**
  * Marked decides emphasis over a copy of the inline text in which code
- * spans are masked out, and the masking pairs backtick runs across the
- * whole paragraph — even runs sitting inside link labels. A delimiter
- * run inside a masked range is inert. The ranges use plain code-span
- * pairing (a run closes at the next run of equal length), computed
- * independently of how links and spans actually tokenize.
+ * spans are masked out. The ranges use plain code-span pairing (a run
+ * closes at the next run of equal length), computed independently of
+ * how links and spans actually tokenize. A delimiter run inside a
+ * masked range is inert AS A CLOSER only: it can still open. So a
+ * `__` whose opener sits inside a range but whose closer sits outside
+ * it forms a strong, while a `~~...~~` pair fully inside a range never
+ * closes and stays literal (and a fully-inside run is skipped as a
+ * closer, letting an inside opener reach a later outside closer).
+ *
+ * Separately, the label of a full-reference link whose reference
+ * resolves is emphasis-inert (same closer-only sense) in the outer
+ * pass when the bracket never tokenizes (its `[` sits inside a code
+ * range): the reference renderer masks such label regions wholesale,
+ * so the `*not emphasis*` in `[a `*not emphasis*` build][ref]` stays
+ * literal. Those ranges are returned as `inert`; they are not code
+ * ranges.
  */
-function computeCodeMasks(text) {
+function computeCodeMasks(text, defs) {
   const ranges = [];
   const n = text.length;
   let i = 0;
@@ -1683,7 +1694,27 @@ function computeCodeMasks(text) {
     }
     i++;
   }
-  return ranges;
+  const inert = [];
+  if (defs && ranges.length) {
+    // Only a `[` inside a code range can start a fake label, so only
+    // range interiors are scanned.
+    for (const [ra, rb] of ranges) {
+      for (let p = ra; p < rb; p++) {
+        if (text[p] !== '[') continue;
+        let bs = 0;
+        while (p - bs - 1 >= 0 && text[p - bs - 1] === '\\') bs++;
+        if (bs % 2 === 1) continue;
+        const cp = findBracketClose(text, p + 1);
+        if (cp < 0 || text[cp + 1] !== '[') continue;
+        const lab = scanRefLabel(text, cp + 2);
+        if (!lab) continue;
+        const label = text.slice(p + 1, cp);
+        const rawLabel = lab.raw === '' ? label : lab.raw;
+        if (defs.get(normalizeLabel(rawLabel))) inert.push([p + 1, cp]);
+      }
+    }
+  }
+  return { ranges, inert };
 }
 
 /**
@@ -1740,16 +1771,17 @@ function parseInline(text, ctx) {
   // (the scan-time autolink rule needs it per character).
   let activeBrackets = 0;
   const n = text.length;
-  const masks = text.indexOf('`') >= 0 ? computeCodeMasks(text) : null;
-  const inMask = masks
-    ? (pos) => {
-        for (const [a, b] of masks) {
-          if (pos < a) return false;
-          if (pos < b) return true;
-        }
-        return false;
-      }
-    : () => false;
+  const masks = (text.indexOf('`') >= 0 || text.indexOf('[') >= 0)
+    ? computeCodeMasks(text, defs) : null;
+  const inRanges = (ranges, pos) => {
+    for (const [a, b] of ranges) {
+      if (pos < a) return false;
+      if (pos < b) return true;
+    }
+    return false;
+  };
+  const inMask = masks ? (pos) => inRanges(masks.ranges, pos) : () => false;
+  const inInert = masks ? (pos) => inRanges(masks.inert, pos) : () => false;
   let buf = '';
   let i = 0;
   const flushText = () => {
@@ -2034,7 +2066,6 @@ function parseInline(text, ctx) {
       let run = 0;
       while (i + run < n && text[i + run] === c) run++;
       if (i < deadUntil) { buf += text.slice(i, i + run); i += run; continue; }
-      if (inMask(i) && bracketStack.length === 0) { buf += text.slice(i, i + run); i += run; continue; }
       if (c === '~' && run >= 3) { buf += text.slice(i, i + run); i += run; continue; }
       const fl = flanking(text, i, run);
       let canOpen;
@@ -2045,6 +2076,12 @@ function parseInline(text, ctx) {
       } else {
         canOpen = fl.left;
         canClose = fl.right;
+      }
+      // A run inside a code mask (or an inert reference-label region)
+      // is inert as a closer but can still open — see computeCodeMasks.
+      // Inside a bracket the label pass decides for itself.
+      if (canClose && bracketStack.length === 0 && (inMask(i) || inInert(i))) {
+        canClose = false;
       }
       if (!canOpen && !canClose) {
         // A run that can neither open nor close is plain text; keeping it
