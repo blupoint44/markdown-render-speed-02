@@ -1193,7 +1193,7 @@ function lexBlocks(lines, start, end, defs, tailTerminated, spans, inListItem = 
             break;
           }
         }
-        content.push(dropColumns(L, fence.indent));
+        content.push(dropFenceIndent(L, fence.indent));
         j++;
       }
       const joined = content.join('\n');
@@ -1550,6 +1550,18 @@ function computeCodeMasks(text) {
     i++;
   }
   return ranges;
+}
+
+/**
+ * Fence content dedent: a content line loses up to `indent` leading
+ * whitespace CHARACTERS — a tab counts as one character, not four
+ * columns (``` at indent 1 turns a leading tab into nothing, while
+ * one leading space in front of the tab shields it).
+ */
+function dropFenceIndent(line, indent) {
+  let i = 0;
+  while (i < indent && (line[i] === ' ' || line[i] === '\t')) i++;
+  return line.slice(i);
 }
 
 function parseInline(text, ctx) {
