@@ -1183,7 +1183,12 @@ function lexList(lines, i, end, defs, firstMarker, tailTerminated) {
       break;
     }
     const itemSpans = [];
-    const itemBlocks = lexBlocks(itemLines, 0, itemLines.length, defs, false, itemSpans, true);
+    // An item separated from its successor by exactly one blank line
+    // keeps the newline that ends its last line (visible when the last
+    // block is a raw HTML block: `... tail\n</li>`); two or more blank
+    // lines, or the end of the list, drop it.
+    const itemBlocks = lexBlocks(itemLines, 0, itemLines.length, defs,
+      sibling && blanks === 1, itemSpans, true);
     // The list is loose when two blocks of one item are separated by a
     // blank line (blank lines inside a single block, e.g. a fence, and
     // blank lines inside nested items do not count at this level).
