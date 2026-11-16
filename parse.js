@@ -1486,6 +1486,22 @@ function processEmphasis(nodes, delimStack, bottom) {
       const op = delimStack[k];
       if (op.ch !== closer.ch || !op.canOpen) continue;
       if (closer.ch === '~' && op.len !== closer.len) continue;
+      if (op.masked) {
+        // Scan-time matching claims masked openers earliest first: an
+        // unmasked closer that reaches a masked opener while an
+        // earlier masked opener of the same char is still open belongs
+        // to that earlier opener; this one falls to the recursion
+        // inside the earlier span (and usually stays literal).
+        let earlierMasked = false;
+        for (let m = bottom; m < k; m++) {
+          const d = delimStack[m];
+          if (d.ch === closer.ch && d.canOpen && d.len > 0 && d.masked) {
+            earlierMasked = true;
+            break;
+          }
+        }
+        if (earlierMasked) { examined = true; continue; }
+      }
       const block = emphBlocked(op, closer);
       if (block) {
         // Span-block skip: a length-1 closer refused by the span rule
@@ -2088,7 +2104,8 @@ function parseInline(text, ctx) {
       // A run inside a code mask (or an inert reference-label region)
       // is inert as a closer but can still open — see computeCodeMasks.
       // Inside a bracket the label pass decides for itself.
-      if (canClose && bracketStack.length === 0 && (inMask(i) || inInert(i))) {
+      const masked = bracketStack.length === 0 && (inMask(i) || inInert(i));
+      if (canClose && masked) {
         canClose = false;
       }
       if (!canOpen && !canClose) {
@@ -2099,7 +2116,7 @@ function parseInline(text, ctx) {
         continue;
       }
       flushText();
-      const node = { t: 'delim', ch: c, len: run, origLen: run, canOpen, canClose };
+      const node = { t: 'delim', ch: c, len: run, origLen: run, canOpen, canClose, masked };
       nodes.push(node);
       delimStack.push(node);
       i += run;
