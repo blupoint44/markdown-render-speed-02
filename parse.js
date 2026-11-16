@@ -1583,6 +1583,12 @@ function processEmphasis(nodes, delimStack, bottom) {
       t: closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em',
       children,
     };
+    // Source extent of the span's content, for the two-phase mask
+    // recursion at the end of parseInline (see applySpanRecursion).
+    if (opener.pos !== undefined && closer.pos !== undefined) {
+      wrap.srcStart = opener.pos + opener.origLen;
+      wrap.srcEnd = closer.pos;
+    }
     const seg = [];
     if (opener.len > 0) seg.push(opener);
     seg.push(wrap);
@@ -2105,18 +2111,24 @@ function parseInline(text, ctx) {
       // is inert as a closer but can still open — see computeCodeMasks.
       // Inside a bracket the label pass decides for itself.
       const masked = bracketStack.length === 0 && (inMask(i) || inInert(i));
+      const canCloseRaw = canClose;
       if (canClose && masked) {
         canClose = false;
       }
-      if (!canOpen && !canClose) {
+      if (!canOpen && !canClose && !(masked && canCloseRaw)) {
         // A run that can neither open nor close is plain text; keeping it
-        // in the text buffer lets autolink detection see across it.
+        // in the text buffer lets autolink detection see across it. The
+        // exception is a run that could close but for the mask: it stays
+        // on the stack as an inert delimiter (it can neither open nor
+        // close in this pass) so the two-phase mask recursion can revive
+        // it inside a span matched from outside, where the content's own
+        // mask may not cover it.
         buf += text.slice(i, i + run);
         i += run;
         continue;
       }
       flushText();
-      const node = { t: 'delim', ch: c, len: run, origLen: run, canOpen, canClose, masked };
+      const node = { t: 'delim', ch: c, len: run, origLen: run, canOpen, canClose, canCloseRaw, masked, pos: i };
       nodes.push(node);
       delimStack.push(node);
       i += run;
@@ -2125,8 +2137,64 @@ function parseInline(text, ctx) {
     buf += c;
     i++;
   }
+  // Two-phase mask recursion. The outer pass above decides emphasis over
+  // the whole text with the global code mask, in which a masked run is
+  // inert as a closer. But the reference renderer re-parses the content
+  // of a span it matched from outside with the content's OWN mask: a
+  // backtick pairing that only spans the boundary (an opening run before
+  // the span pairing with one inside it, or vice versa) does not mask
+  // the content, so delimiter pairs fully inside the span can form there
+  // even though both runs were masked in the outer pass. This pass walks
+  // the finished tree; for each matched span it recomputes the mask over
+  // the span's content substring, flips the mask status of the span's
+  // still-unmatched delimiter children to the local verdict (restoring a
+  // mask-killed closer from canCloseRaw, or masking one the local
+  // pairing covers), and re-runs the matcher over those children only.
+  // Spans never matched in the outer pass get no second chance — pairs
+  // form here only inside a span that was actually matched outside.
+  // Newly formed inner spans are visited in turn (recursion is
+  // recursive), each against its own content mask.
+  const applySpanRecursion = (list) => {
+    for (const node of list) {
+      if (!node.children) continue;
+      if ((node.t === 'em' || node.t === 'strong' || node.t === 'del') &&
+          node.srcStart !== undefined) {
+        const delims = node.children.filter((nd) => nd.t === 'delim');
+        if (delims.length) {
+          const content = text.slice(node.srcStart, node.srcEnd);
+          if (delims.some((d) => d.masked) || content.indexOf('`') >= 0) {
+            const local = computeCodeMasks(content, defs);
+            const inLocal = (ranges, pos) => {
+              for (const [a, b] of ranges) {
+                if (pos < a) return false;
+                if (pos < b) return true;
+              }
+              return false;
+            };
+            let changed = false;
+            for (const d of delims) {
+              const lp = d.pos - node.srcStart;
+              const lm = inLocal(local.ranges, lp) || inLocal(local.inert, lp);
+              if (lm === d.masked) continue;
+              if (d.masked) {
+                d.masked = false;
+                d.canClose = d.canCloseRaw;
+              } else {
+                d.masked = true;
+                d.canClose = false;
+              }
+              changed = true;
+            }
+            if (changed) processEmphasis(node.children, delims.slice(), 0);
+          }
+        }
+      }
+      applySpanRecursion(node.children);
+    }
+  };
   flushText();
   processEmphasis(nodes, delimStack, 0);
+  applySpanRecursion(nodes);
   return nodes;
 }
 
