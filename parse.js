@@ -978,6 +978,31 @@ function linesEndInOpenFence(lines, defs, inListItem = false) {
   return blocksEndInOpenFence(lexBlocks(lines, 0, lines.length, defs, true, null, inListItem));
 }
 
+const CAPTURE_FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
+
+/**
+ * Whether the list capture refuses to feed an unindented line to an
+ * item's open fence because of the item's previous line P. The
+ * capture treats the fence stretch as ended when P is block-shaped:
+ * a fence-run line (e.g. a content line "```inner x```", or a tilde
+ * line inside a backtick fence — the capture cannot tell those from
+ * a closing line), an ATX heading, a thematic break, or an HTML
+ * block start (types 1-6). The shape test only applies while P's
+ * own indent is shallower than the item's content indent; a line
+ * starting with four or more spaces always ends the stretch.
+ */
+function fenceFeedBlocked(P, contentIndent) {
+  if (/^ {4}/.test(P)) return true;
+  const sp = /^ */.exec(P)[0].length;
+  if (sp >= contentIndent) return false;
+  const s = P.slice(sp);
+  if (CAPTURE_FENCE_RE.test(P)) return true;
+  if (/^#{1,6}(?:\s|$)/.test(s)) return true;
+  if (isThematicBreak(P)) return true;
+  const hb = htmlBlockStart(P);
+  return !!hb && hb.type !== 7;
+}
+
 // ---------------------------------------------------------------------------
 // Containers: blockquotes and lists
 // ---------------------------------------------------------------------------
@@ -1156,13 +1181,22 @@ function lexList(lines, i, end, defs, firstMarker, tailTerminated) {
         break;
       }
       if (blanks === 0 && linesEndInOpenFence(itemLines, defs, true) &&
+          !fenceFeedBlocked(itemLines[itemLines.length - 1], contentIndent) &&
           !interruptsParagraph(L, true)) {
-        itemLines.push(rebaseLeading(dropColumns(L, contentIndent), contentIndent));
+        // A line fed lazily to an open fence keeps its text verbatim:
+        // the capture does not dedent it by the content indent.
+        itemLines.push(L);
         hadContent = true;
         j++;
         continue;
       }
-      if (blanks === 0 && endsInParagraph(itemLines, defs, true)) {
+      // A paragraph whose last line is deeply indented (four or more
+      // columns after the item dedent — an indented-code-shaped
+      // continuation) no longer accepts a lazy continuation: the
+      // reference renderer's item capture ends the item there, and
+      // the unindented line starts a new block outside the list.
+      if (blanks === 0 && leadingCols(itemLines[itemLines.length - 1]) < 4 &&
+          endsInParagraph(itemLines, defs, true)) {
         const su = setextLevel(L);
         if (su && !isThematicBreak(L)) {
           // A setext underline lazily continues the item's paragraph as
@@ -1638,6 +1672,21 @@ function anchorStateAfter(html, state) {
   return state;
 }
 
+/**
+ * An opening `<code>` or `<kbd>` tag switches the rest of the inline
+ * run to raw text: text nodes render without escaping (entities pass
+ * through verbatim, bare autolinks still form) until a closing tag of
+ * either name. The state is a plain boolean — a nested opener does
+ * not stack, any matching closer ends it — and it resets at every
+ * block's inline run. A self-closing tag, or one whose name is
+ * followed by a newline, does not open the state.
+ */
+function codeStateAfter(html, state) {
+  if (/^<\/(?:code|kbd)\s*>/i.test(html)) return false;
+  if (/^<(?:code|kbd)(?=[ \t>])/i.test(html) && !html.endsWith('/>')) return true;
+  return state;
+}
+
 /** Start of the first backtick run of exactly `run` in text before limit. */
 function findCodeClose(text, from, run, limit) {
   const n = Math.min(text.length, limit);
@@ -1778,11 +1827,27 @@ function urlPrefixAt(s, p) {
  * candidate outside any code-span mask. Used to decide whether a
  * failed bracket's span must be rescanned as ordinary text. */
 function labelHasUrl(text, from, to, inMask) {
+  // Only a URL in the label's own plain text counts: one inside a
+  // nested bracket (its label text, or the destination group of a
+  // nested link/image that formed) was already consumed by that
+  // construct and does not trigger the fallback rescan.
+  let depth = 0;
   for (let p = from; p < to; p++) {
+    if (inMask(p)) continue;
     const ch = text[p];
+    if (ch === '\\') { p++; continue; }
+    if (ch === '[') { depth++; continue; }
+    if (ch === ']') {
+      if (depth > 0) depth--;
+      if (text[p + 1] === '(' && parseLinkParens(text, p + 2)) {
+        const gEnd = scanParenGroupEnd(text, p + 1);
+        if (gEnd > 0) p = Math.min(gEnd - 1, to - 1);
+      }
+      continue;
+    }
+    if (depth > 0) continue;
     if (ch !== 'w' && ch !== 'h' && ch !== 'H' && ch !== 'f' && ch !== 'F') continue;
     if (!urlPrefixAt(text, p)) continue;
-    if (inMask(p)) continue;
     if (matchUrlAutolink(text, p)) return true;
   }
   return false;
@@ -1962,6 +2027,7 @@ function parseInline(text, ctx) {
       nodes.push(node);
       bracketStack.push({
         node, isImage: true, delimLen: delimStack.length, active: true, srcStart: i + 2,
+        anchorSnap: rawAnchor,
       });
       activeBrackets++;
       i += 2;
@@ -1973,6 +2039,7 @@ function parseInline(text, ctx) {
       nodes.push(node);
       bracketStack.push({
         node, isImage: false, delimLen: delimStack.length, active: true, srcStart: i + 1,
+        anchorSnap: rawAnchor,
       });
       activeBrackets++;
       i += 1;
@@ -2009,6 +2076,7 @@ function parseInline(text, ctx) {
       // renders the whole span with emphasis suppressed.
       let link = null;
       let consumedEnd = -1;
+      let viaParens = false;
       let refBlocked = false;
       let parenFailed = false;
       let parenEnd = -1;
@@ -2019,6 +2087,7 @@ function parseInline(text, ctx) {
         if (p && !labelBad) {
           link = p;
           consumedEnd = p.end;
+          viaParens = true;
         } else {
           const gEnd = scanParenGroupEnd(text, i + 1);
           if (gEnd > 0) { parenFailed = true; parenEnd = gEnd; }
@@ -2069,6 +2138,23 @@ function parseInline(text, ctx) {
       }
       processEmphasis(nodes, delimStack, bracket.delimLen);
       if (link) {
+        // A formed link insulates the raw-anchor state: tags inside
+        // its label neither set nor clear the state for the text
+        // that follows the link (a failed bracket insulates nothing).
+        rawAnchor = bracket.anchorSnap;
+        // A reference link consumes its label whole: a code span
+        // whose opening run sits inside the label can never form in
+        // the reference scan (its backticks became label text), so
+        // any mask range starting there is stale and must stop
+        // shadowing the text that follows. An inline (...) link is
+        // the opposite: its label's backtick runs still pair with
+        // later runs for mask purposes and the range keeps its
+        // shadow over the text up to the next code span.
+        if (masks && !viaParens) {
+          const from = bracket.srcStart - (bracket.isImage ? 2 : 1);
+          masks.ranges = masks.ranges.filter(([a]) => a < from || a >= consumedEnd);
+          masks.inert = masks.inert.filter(([a]) => a < from || a >= consumedEnd);
+        }
         flushText();
         const bIdx = nodes.indexOf(bracket.node);
         const children = nodes.splice(bIdx + 1);
@@ -2282,6 +2368,11 @@ function scanLabelBackticks(label) {
       continue;
     }
     if (nextRunEnd >= 0) { i = nextRunEnd; continue; }
+    // A last backtick run that reaches the very end of the label and
+    // is at least two long does not invalidate the label in marked
+    // ([``](x) and [a ```](x) link, their labels rendering the run
+    // literally); a lone single backtick there still does.
+    if (run >= 2 && i + run >= n) { i = n; continue; }
     valid = false;
     break;
   }
@@ -2428,7 +2519,9 @@ function matchUrlAutolink(s, pos) {
   }
   const sm = /^(https?|ftp):\/\//i.exec(s.slice(pos, pos + 8));
   if (sm) {
-    if (prevAlnum) return null;
+    // No preceding-character restriction for scheme URLs: the
+    // reference commits to the URL at its first character even in
+    // mid-word (ehttp://p links), unlike the www. form above.
     let e = pos;
     while (e < n && !isWsCh(s[e]) && s[e] !== '<') e++;
     const matched = trimAutolink(cutUnclosedParen(s.slice(pos, e)));
@@ -2493,7 +2586,7 @@ function isAutolinkTrigger(s, j) {
   return false;
 }
 
-function renderText(s, inLink, nextCh) {
+function renderText(s, inLink, nextCh, raw = false) {
   let out = '';
   let i = 0;
   const n = s.length;
@@ -2507,7 +2600,7 @@ function renderText(s, inLink, nextCh) {
         continue;
       }
     }
-    if (c === '&') {
+    if (!raw && c === '&') {
       NUM_DEC_RE.lastIndex = i;
       let m = NUM_DEC_RE.exec(s);
       if (m) {
@@ -2533,14 +2626,14 @@ function renderText(s, inLink, nextCh) {
       i++;
       continue;
     }
-    if (c === '<') { out += '&lt;'; i++; continue; }
-    if (c === '>') { out += '&gt;'; i++; continue; }
-    if (c === '"') { out += '&quot;'; i++; continue; }
-    if (c === "'") { out += '&#39;'; i++; continue; }
+    if (!raw && c === '<') { out += '&lt;'; i++; continue; }
+    if (!raw && c === '>') { out += '&gt;'; i++; continue; }
+    if (!raw && c === '"') { out += '&quot;'; i++; continue; }
+    if (!raw && c === "'") { out += '&#39;'; i++; continue; }
     let j = i + 1;
     while (j < n) {
       const d = s[j];
-      if (d === '&' || d === '<' || d === '>' || d === '"' || d === "'") break;
+      if (!raw && (d === '&' || d === '<' || d === '>' || d === '"' || d === "'")) break;
       if (!inLink && isAutolinkTrigger(s, j)) break;
       j++;
     }
@@ -2588,12 +2681,13 @@ function renderNodes(nodes, ctx, inLink) {
           if (nx.t === 'delim') nextCh = nx.ch;
           else if (nx.t === 'text') nextCh = nx.s[0] ?? '';
         }
-        out += renderText(nd.s, inLink || ctx.inRawAnchor, nextCh);
+        out += renderText(nd.s, inLink || ctx.inRawAnchor, nextCh, ctx.inRawCode);
         break;
       }
       case 'code': out += '<code>' + escapeHtml(nd.s) + '</code>'; break;
       case 'html':
         ctx.inRawAnchor = anchorStateAfter(nd.s, ctx.inRawAnchor);
+        ctx.inRawCode = codeStateAfter(nd.s, ctx.inRawCode);
         out += nd.s;
         break;
       case 'br': out += '<br>'; break;
@@ -2606,11 +2700,17 @@ function renderNodes(nodes, ctx, inLink) {
         if (nd.title !== null && nd.title !== undefined) {
           out += ' title="' + escapeAttr(nd.title) + '"';
         }
+        // The label's tags do not move the raw-anchor state of the
+        // surrounding run (scan time insulates them the same way).
+        const savedAnchor = ctx.inRawAnchor;
         out += '>' + renderNodes(nd.children, ctx, true) + '</a>';
+        ctx.inRawAnchor = savedAnchor;
         break;
       }
       case 'image': {
+        const savedAnchor = ctx.inRawAnchor;
         const alt = altText(nd.children, ctx);
+        ctx.inRawAnchor = savedAnchor;
         out += '<img src="' + escapeAttr(cleanUrl(nd.href)) + '" alt="' + alt + '"';
         if (nd.title !== null && nd.title !== undefined) {
           out += ' title="' + escapeAttr(nd.title) + '"';
@@ -2633,6 +2733,7 @@ function renderNodes(nodes, ctx, inLink) {
 }
 
 function renderInline(text, ctx) {
+  ctx.inRawCode = false;
   return renderNodes(parseInline(text, ctx), ctx, false);
 }
 
@@ -2740,6 +2841,6 @@ export function parse(markdown) {
   if (tailTerminated) lines.pop();
   const defs = new Map();
   const blocks = lexBlocks(lines, 0, lines.length, defs, tailTerminated);
-  const ctx = { defs, inRawAnchor: false };
+  const ctx = { defs, inRawAnchor: false, inRawCode: false };
   return renderBlocks(blocks, ctx, false);
 }
