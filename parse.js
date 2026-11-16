@@ -998,9 +998,9 @@ function lexBlockquote(lines, i, end, defs, tailTerminated) {
       }
       if (isParaContinuation(inner[inner.length - 1], line)) {
         cont.add(inner.length);
-        // Lazy lines keep their indentation up to three columns; a
-        // deeper-indented lazy line loses its leading whitespace.
-        inner.push(leadingCols(line) >= 4 ? line.replace(/^[ \t]+/, '') : line);
+        // Lazy lines keep their indentation below four columns; at
+        // four or more they lose exactly the four-column prefix.
+        inner.push(leadingCols(line) >= 4 ? dropColumns(line, 4) : line);
         prevLazy = true;
         j++;
         continue;
